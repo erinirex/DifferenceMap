@@ -1,27 +1,18 @@
-import ast
+import argparse
+import math
 import os
 
 import cv2
 import numpy as np
-import pandas as pd
 import torch
+import torch.nn.functional as F
 from PIL import Image
-from mmdet.datasets.api_wrappers import COCO
 from torch import nn
 from torchvision.models import resnet50
 import torchvision.transforms as T
 
 
 device = "cuda:0" if torch.cuda.is_available() else "cpu"
-
-COCO_ANN_FILE = "../../data/coco/annotations/instances_train2017.json"
-INPUT_CSV = "detr_context_influence_all_info_1000img.csv"
-OUTPUT_CSV = "detr_context_influence_all_info_1000img_decoder_attn.csv"
-IMAGE_ROOT = "../../data"
-
-DET_THRESHOLD = 0.7
-MATCH_IOU_THRESHOLD = 0.4
-MAX_VALID_IMAGES_PER_PAIR = 1000
 
 
 CLASSES = [
@@ -42,12 +33,33 @@ CLASSES = [
 ]
 
 
-class DecoderLayerWithSelfAttn(nn.TransformerDecoderLayer):
-    """Transformer decoder layer that stores object-query self-attention."""
+class DecoderLayerForECLIP(nn.TransformerDecoderLayer):
+    """Decoder layer that keeps the tensors needed for object-query ECLIP."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.self_attn_weights = None
+        self.eclip_record = {}
+
+    def _project_self_attn_qkv(self, tgt):
+        embed_dim = self.self_attn.embed_dim
+        num_heads = self.self_attn.num_heads
+        head_dim = embed_dim // num_heads
+
+        weight = self.self_attn.in_proj_weight
+        bias = self.self_attn.in_proj_bias
+        q_w, k_w, v_w = weight.chunk(3, dim=0)
+        q_b, k_b, v_b = bias.chunk(3, dim=0) if bias is not None else (None, None, None)
+
+        q = F.linear(tgt, q_w, q_b)
+        k = F.linear(tgt, k_w, k_b)
+        v = F.linear(tgt, v_w, v_b)
+
+        def to_heads(x):
+            # [num_queries, batch, hidden] -> [batch, heads, num_queries, head_dim]
+            nq, batch, _ = x.shape
+            return x.permute(1, 0, 2).contiguous().view(batch, nq, num_heads, head_dim).transpose(1, 2)
+
+        return to_heads(q), to_heads(k), to_heads(v)
 
     def forward(
         self,
@@ -60,6 +72,8 @@ class DecoderLayerWithSelfAttn(nn.TransformerDecoderLayer):
         tgt_is_causal=False,
         memory_is_causal=False,
     ):
+        q_heads, k_heads, v_heads = self._project_self_attn_qkv(tgt)
+
         tgt2, attn_weights = self.self_attn(
             tgt,
             tgt,
@@ -69,7 +83,15 @@ class DecoderLayerWithSelfAttn(nn.TransformerDecoderLayer):
             need_weights=True,
             average_attn_weights=False,
         )
-        self.self_attn_weights = attn_weights.detach()
+
+        # tgt2 keeps graph, so gradients from the classification logit can flow here.
+        self.eclip_record = {
+            "q": q_heads.detach(),
+            "k": k_heads.detach(),
+            "v": v_heads.detach(),
+            "attn": attn_weights.detach(),
+            "attn_out": tgt2,
+        }
 
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
@@ -101,7 +123,6 @@ class DETRdemo(nn.Module):
         num_decoder_layers=6,
     ):
         super().__init__()
-
         self.backbone = resnet50()
         del self.backbone.fc
 
@@ -112,18 +133,14 @@ class DETRdemo(nn.Module):
             num_encoder_layers,
             num_decoder_layers,
         )
-
-        decoder_layer = DecoderLayerWithSelfAttn(
+        decoder_layer = DecoderLayerForECLIP(
             d_model=hidden_dim,
             nhead=nheads,
             dim_feedforward=2048,
             dropout=0.1,
             activation="relu",
         )
-        self.transformer.decoder = nn.TransformerDecoder(
-            decoder_layer,
-            num_layers=num_decoder_layers,
-        )
+        self.transformer.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_decoder_layers)
 
         self.linear_class = nn.Linear(hidden_dim, num_classes + 1)
         self.linear_bbox = nn.Linear(hidden_dim, 4)
@@ -151,24 +168,26 @@ class DETRdemo(nn.Module):
             dim=-1,
         ).flatten(0, 1).unsqueeze(1)
 
-        encoder_input = pos + 0.1 * h.flatten(2).permute(2, 0, 1)
-        encoder_output = self.transformer.encoder(encoder_input)
-
+        src = pos + 0.1 * h.flatten(2).permute(2, 0, 1)
+        memory = self.transformer.encoder(src)
         query_embed = self.query_pos.unsqueeze(1)
-        decoder_output = self.transformer.decoder(query_embed, encoder_output)
+        hs = self.transformer.decoder(query_embed, memory).transpose(0, 1)
 
-        decoder_self_attns = []
-        for layer in self.transformer.decoder.layers:
-            attn = layer.self_attn_weights
-            if attn is not None:
-                decoder_self_attns.append(attn[0])
-
-        h = decoder_output.transpose(0, 1)
+        records = [layer.eclip_record for layer in self.transformer.decoder.layers]
         return {
-            "pred_logits": self.linear_class(h),
-            "pred_boxes": self.linear_bbox(h).sigmoid(),
-            "decoder_self_attns": decoder_self_attns,
+            "pred_logits": self.linear_class(hs),
+            "pred_boxes": self.linear_bbox(hs).sigmoid(),
+            "decoder_eclip_records": records,
         }
+
+
+transform = T.Compose(
+    [
+        T.Resize(800),
+        T.ToTensor(),
+        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ]
+)
 
 
 def build_model():
@@ -184,24 +203,10 @@ def build_model():
     return model
 
 
-transform = T.Compose(
-    [
-        T.Resize(800),
-        T.ToTensor(),
-        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-    ]
-)
-
-
 def box_cxcywh_to_xyxy(x):
     x_c, y_c, w, h = x.unbind(1)
     return torch.stack(
-        [
-            x_c - 0.5 * w,
-            y_c - 0.5 * h,
-            x_c + 0.5 * w,
-            y_c + 0.5 * h,
-        ],
+        [x_c - 0.5 * w, y_c - 0.5 * h, x_c + 0.5 * w, y_c + 0.5 * h],
         dim=1,
     )
 
@@ -209,280 +214,161 @@ def box_cxcywh_to_xyxy(x):
 def rescale_bboxes(out_bbox, size):
     img_w, img_h = size
     boxes = box_cxcywh_to_xyxy(out_bbox)
-    scale = torch.tensor([img_w, img_h, img_w, img_h], dtype=torch.float32, device=device)
+    scale = torch.tensor([img_w, img_h, img_w, img_h], dtype=torch.float32, device=out_bbox.device)
     return boxes * scale
 
 
-def bbox_iou(box1, box2):
-    x1 = torch.max(box1[0], box2[0])
-    y1 = torch.max(box1[1], box2[1])
-    x2 = torch.min(box1[2], box2[2])
-    y2 = torch.min(box1[3], box2[3])
-    inter = torch.clamp(x2 - x1, min=0) * torch.clamp(y2 - y1, min=0)
-    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
-    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
-    return inter / (area1 + area2 - inter + 1e-6)
+def detect_with_graph(image, model):
+    img = transform(image).unsqueeze(0).to(device)
+    return model(img)
 
 
-def compute_context_influence(decoder_self_attns, layer_reduce="sum"):
-    """Return object-query influence matrix with shape [source_query, target_query]."""
-    layer_scores = []
-    for attn in decoder_self_attns:
-        # attn: [num_heads, target_query, source_query]
-        score = attn.mean(dim=0).transpose(0, 1)
-        layer_scores.append(score)
-
-    per_layer = torch.stack(layer_scores, dim=0)
-    if layer_reduce == "mean":
-        return per_layer.mean(dim=0), per_layer
-    if layer_reduce == "sum":
-        return per_layer.sum(dim=0), per_layer
-    return per_layer, per_layer
-
-
-@torch.no_grad()
-def detect(im, model, keep_classes=None, threshold=DET_THRESHOLD):
-    if im.mode == "L":
-        return None
-
-    img = transform(im).unsqueeze(0).to(device)
-    if img.shape[-2] > 1600 or img.shape[-1] > 1600:
-        return None
-
-    outputs = model(img)
-    probas = outputs["pred_logits"].softmax(-1)[0, :, :-1]
+def select_target_query(outputs, target_class=None, target_query=None, threshold=0.5):
+    logits = outputs["pred_logits"][0]
+    probas = logits.softmax(-1)[:, :-1]
     conf, labels = probas.max(dim=1)
 
+    if target_query is not None:
+        q = int(target_query)
+        return q, int(labels[q]), float(conf[q].detach().cpu())
+
     keep = conf > threshold
-    if keep_classes is not None:
-        keep_tensor = torch.tensor(keep_classes, device=labels.device)
-        keep = keep & torch.isin(labels, keep_tensor)
+    if target_class is not None:
+        cls_idx = CLASSES.index(target_class)
+        candidates = torch.where(keep & (labels == cls_idx))[0]
+    else:
+        candidates = torch.where(keep)[0]
 
-    query_ids = torch.arange(probas.shape[0], device=device)[keep]
-    boxes = rescale_bboxes(outputs["pred_boxes"][0, keep], im.size)
-    influence, per_layer_influence = compute_context_influence(outputs["decoder_self_attns"])
+    if candidates.numel() == 0:
+        raise RuntimeError("No target detection found. Lower --threshold or choose another --target-class.")
 
+    best = candidates[conf[candidates].argmax()]
+    return int(best), int(labels[best]), float(conf[best].detach().cpu())
+
+
+def compute_eclip_object_influence(outputs, target_query, target_class_idx, normalize=True):
+    target_logit = outputs["pred_logits"][0, target_query, target_class_idx]
+    records = outputs["decoder_eclip_records"]
+
+    per_layer = []
+    for rec in records:
+        attn = rec["attn"][0]       # [heads, target_query, source_query]
+        v = rec["v"][0]             # [heads, source_query, head_dim]
+        attn_out = rec["attn_out"]  # [source_query, batch, hidden]
+
+        grad = torch.autograd.grad(
+            target_logit,
+            attn_out,
+            retain_graph=True,
+            allow_unused=False,
+        )[0]
+
+        grad_t = grad[target_query, 0]  # [hidden]
+        num_heads, num_queries, head_dim = v.shape
+        grad_t = grad_t.view(num_heads, head_dim)
+        lam = attn[:, target_query, :]  # [heads, source_query]
+
+        contrib = v * grad_t[:, None, :] * lam[:, :, None]
+        contrib = F.relu(contrib.sum(dim=-1)).mean(dim=0)  # [source_query]
+        contrib[target_query] = 0
+
+        if normalize:
+            contrib = contrib / (contrib.max() + 1e-8)
+
+        per_layer.append(contrib)
+
+    per_layer = torch.stack(per_layer, dim=0)
+    total = per_layer.mean(dim=0)
+    return per_layer.detach(), total.detach()
+
+
+def get_detections(outputs, image_size, threshold):
+    probas = outputs["pred_logits"].softmax(-1)[0, :, :-1]
+    conf, labels = probas.max(dim=1)
+    keep = conf > threshold
+    query_ids = torch.arange(probas.shape[0], device=probas.device)[keep]
+    boxes = rescale_bboxes(outputs["pred_boxes"][0, keep], image_size)
     return {
-        "scores": conf[keep].detach().cpu(),
-        "labels": labels[keep].detach().cpu(),
-        "boxes": boxes.detach().cpu(),
         "query_ids": query_ids.detach().cpu(),
-        "influence": influence.detach().cpu(),
-        "per_layer_influence": per_layer_influence.detach().cpu(),
+        "boxes": boxes.detach().cpu(),
+        "labels": labels[keep].detach().cpu(),
+        "scores": conf[keep].detach().cpu(),
     }
 
 
-def get_gt_boxes(coco, img_path, category_names):
-    filename = os.path.basename(img_path)
-    img_id = int(os.path.splitext(filename)[0])
+def draw_visualization(image_path, detections, influence, target_query, target_label, output_path):
+    img = cv2.imread(image_path)
+    if img is None:
+        raise RuntimeError(f"Could not read image: {image_path}")
 
-    all_categories = coco.loadCats(coco.getCatIds())
-    name_to_id = {cat["name"]: cat["id"] for cat in all_categories}
-    desired_ids = {
-        name_to_id[name]
-        for name in category_names
-        if name in name_to_id
-    }
+    influence = influence.detach().cpu()
+    target_color = (0, 0, 255)
+    source_color = (255, 180, 0)
 
-    ann_ids = coco.getAnnIds(imgIds=[img_id])
-    anns = coco.loadAnns(ann_ids)
+    order = torch.argsort(influence[detections["query_ids"]], descending=True)
+    for rank_idx in order.tolist():
+        q = int(detections["query_ids"][rank_idx])
+        box = detections["boxes"][rank_idx].numpy().astype(int)
+        label = int(detections["labels"][rank_idx])
+        score = float(detections["scores"][rank_idx])
+        val = float(influence[q])
 
-    gt_boxes = []
-    gt_names = []
-    id_to_name = {v: k for k, v in name_to_id.items()}
-    for ann in anns:
-        cat_id = ann["category_id"]
-        if cat_id not in desired_ids:
-            continue
-        x, y, w, h = ann["bbox"]
-        gt_boxes.append(torch.tensor([x, y, x + w, y + h], dtype=torch.float32))
-        gt_names.append(id_to_name[cat_id])
+        x1, y1, x2, y2 = box.tolist()
+        color = target_color if q == target_query else source_color
+        thickness = 3 if q == target_query else 2
+        cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
 
-    if not gt_boxes:
-        return torch.empty((0, 4)), []
-    return torch.stack(gt_boxes), gt_names
+        if q == target_query:
+            text = f"TARGET q{q} {CLASSES[label]} {score:.2f}"
+        else:
+            text = f"q{q} {CLASSES[label]} infl={val:.3f}"
+        cv2.putText(img, text, (x1, max(20, y1 - 7)), cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2)
 
+    title = f"ECLIP object influence on target q{target_query} ({CLASSES[target_label]})"
+    cv2.putText(img, title, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
-def match_detections_to_gt(detections, gt_boxes, gt_names):
-    matches = []
-    used_det = set()
-
-    for gt_idx, (gt_box, gt_name) in enumerate(zip(gt_boxes, gt_names)):
-        best_det_idx = None
-        best_iou = 0.0
-
-        for det_idx, (det_box, det_label) in enumerate(
-            zip(detections["boxes"], detections["labels"])
-        ):
-            if det_idx in used_det:
-                continue
-            if CLASSES[int(det_label)] != gt_name:
-                continue
-
-            iou = float(bbox_iou(gt_box, det_box))
-            if iou > best_iou and iou >= MATCH_IOU_THRESHOLD:
-                best_iou = iou
-                best_det_idx = det_idx
-
-        if best_det_idx is not None:
-            used_det.add(best_det_idx)
-            matches.append(
-                {
-                    "gt_idx": gt_idx,
-                    "det_idx": best_det_idx,
-                    "class_name": gt_name,
-                    "iou": best_iou,
-                }
-            )
-
-    return matches
-
-
-def box_center(box):
-    x1, y1, x2, y2 = box.tolist()
-    return np.array([(x1 + x2) / 2.0, (y1 + y2) / 2.0])
-
-
-def choose_closest_pair(matches, detections, cat_a, cat_b):
-    a_matches = [m for m in matches if m["class_name"] == cat_a]
-    b_matches = [m for m in matches if m["class_name"] == cat_b]
-    if not a_matches or not b_matches:
-        return None, None
-
-    best_a = None
-    best_b = None
-    best_dist = float("inf")
-    for ma in a_matches:
-        center_a = box_center(detections["boxes"][ma["det_idx"]])
-        for mb in b_matches:
-            center_b = box_center(detections["boxes"][mb["det_idx"]])
-            dist = np.linalg.norm(center_a - center_b)
-            if dist < best_dist:
-                best_dist = dist
-                best_a = ma
-                best_b = mb
-
-    return best_a, best_b
-
-
-def add_context_inf(img_path, cat_a, cat_b, model, coco):
-    image = cv2.imread(img_path)
-    if image is None:
-        return None
-
-    with Image.open(img_path) as pil_img:
-        pil_img = pil_img.convert("RGB")
-        keep_classes = [CLASSES.index(cat_a), CLASSES.index(cat_b)]
-        detections = detect(pil_img, model, keep_classes=keep_classes)
-
-    if detections is None or len(detections["boxes"]) < 2:
-        return None
-
-    gt_boxes, gt_names = get_gt_boxes(coco, img_path, [cat_a, cat_b])
-    if len(gt_boxes) < 2:
-        return None
-
-    matches = match_detections_to_gt(detections, gt_boxes, gt_names)
-    match_a, match_b = choose_closest_pair(matches, detections, cat_a, cat_b)
-    if match_a is None or match_b is None:
-        return None
-
-    det_a = match_a["det_idx"]
-    det_b = match_b["det_idx"]
-    query_a = int(detections["query_ids"][det_a])
-    query_b = int(detections["query_ids"][det_b])
-
-    influence = detections["influence"]
-    per_layer = detections["per_layer_influence"]
-
-    target_inf_on_deleted = float(influence[query_a, query_b])
-    deleted_inf_on_target = float(influence[query_b, query_a])
-    per_layer_target_inf_on_deleted = per_layer[:, query_a, query_b].tolist()
-    per_layer_deleted_inf_on_target = per_layer[:, query_b, query_a].tolist()
-
-    return {
-        "target_inf_on_deleted": target_inf_on_deleted,
-        "deleted_inf_on_target": deleted_inf_on_target,
-        "per_layer_target_inf_on_deleted": per_layer_target_inf_on_deleted,
-        "per_layer_deleted_inf_on_target": per_layer_deleted_inf_on_target,
-        "target_query": query_a,
-        "deleted_query": query_b,
-        "target_box": detections["boxes"][det_a].tolist(),
-        "deleted_box": detections["boxes"][det_b].tolist(),
-    }
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    cv2.imwrite(output_path, img)
 
 
 def main():
-    coco = COCO(COCO_ANN_FILE)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--image", required=True)
+    parser.add_argument("--target-class", default=None, choices=[c for c in CLASSES if c != "N/A"])
+    parser.add_argument("--target-query", type=int, default=None)
+    parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument("--output", default="outputs/detr_eclip_object_influence_vis.jpg")
+    args = parser.parse_args()
+
     model = build_model()
-    df = pd.read_csv(INPUT_CSV)
+    image = Image.open(args.image).convert("RGB")
+    outputs = detect_with_graph(image, model)
 
-    for index, row in df.iloc[::2].iterrows():
-        cat_b = row["deleted"]
-        cat_a = row["target"]
-        img_paths = ast.literal_eval(row["img_paths"])
+    target_query, target_label, target_score = select_target_query(
+        outputs,
+        target_class=args.target_class,
+        target_query=args.target_query,
+        threshold=args.threshold,
+    )
+    per_layer, influence = compute_eclip_object_influence(
+        outputs,
+        target_query=target_query,
+        target_class_idx=target_label,
+    )
+    detections = get_detections(outputs, image.size, args.threshold)
+    draw_visualization(args.image, detections, influence, target_query, target_label, args.output)
 
-        print(f"processing pair: target={cat_a}, deleted={cat_b}")
+    print(f"target query: {target_query}")
+    print(f"target class: {CLASSES[target_label]}")
+    print(f"target score: {target_score:.4f}")
+    print(f"visualization saved to: {args.output}")
 
-        valid_img_paths = []
-        target_inf_on_deleted_list = []
-        deleted_inf_on_target_list = []
-        per_image_records = []
+    top = torch.argsort(influence, descending=True)[:10]
+    print("top source queries:")
+    for q in top.tolist():
+        print(f"  q{q}: {float(influence[q]):.5f}")
 
-        for i, rel_img_path in enumerate(img_paths):
-            img_path = os.path.join(IMAGE_ROOT, rel_img_path)
-            result = add_context_inf(img_path, cat_a, cat_b, model, coco)
-            if result is None:
-                continue
-
-            valid_img_paths.append(img_path)
-            target_inf_on_deleted_list.append(result["target_inf_on_deleted"])
-            deleted_inf_on_target_list.append(result["deleted_inf_on_target"])
-            per_image_records.append(
-                {
-                    "img_path": img_path,
-                    **result,
-                }
-            )
-
-            if len(valid_img_paths) >= MAX_VALID_IMAGES_PER_PAIR:
-                break
-
-            if (i + 1) % 100 == 0:
-                print(f"  scanned={i + 1}, valid={len(valid_img_paths)}")
-
-        cnt = len(valid_img_paths)
-        if cnt > 0:
-            target_mean = round(float(np.mean(target_inf_on_deleted_list)), 5)
-            deleted_mean = round(float(np.mean(deleted_inf_on_target_list)), 5)
-            target_median = float(np.median(target_inf_on_deleted_list))
-            deleted_median = float(np.median(deleted_inf_on_target_list))
-        else:
-            target_mean = 0.0
-            deleted_mean = 0.0
-            target_median = 0.0
-            deleted_median = 0.0
-
-        df.loc[index, "context_inf_valid_cnt"] = cnt
-        df.loc[index, "target_inf_on_deleted"] = target_mean
-        df.loc[index, "deleted_inf_on_target"] = deleted_mean
-        df.loc[index, "target_inf_on_deleted_median"] = target_median
-        df.loc[index, "deleted_inf_on_target_median"] = deleted_median
-        df.at[index, "decoder_attn_per_image_records"] = repr(per_image_records)
-
-        if index + 1 in df.index:
-            df.loc[index + 1, "context_inf_valid_cnt"] = cnt
-            df.loc[index + 1, "target_inf_on_deleted"] = deleted_mean
-            df.loc[index + 1, "deleted_inf_on_target"] = target_mean
-            df.loc[index + 1, "target_inf_on_deleted_median"] = deleted_median
-            df.loc[index + 1, "deleted_inf_on_target_median"] = target_median
-
-        df.to_csv(OUTPUT_CSV, index=False)
-        print(f"  valid={cnt}")
-        print(f"  {cat_a} -> {cat_b}: {target_mean}")
-        print(f"  {cat_b} -> {cat_a}: {deleted_mean}")
-
-    print(f"saved to {OUTPUT_CSV}")
+    print("per-layer target-source influence shape:", tuple(per_layer.shape))
 
 
 if __name__ == "__main__":
